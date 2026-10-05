@@ -35,8 +35,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--total-steps", type=int, default=1_000_000)
     p.add_argument("--rollout-steps", type=int, default=512)
-    p.add_argument("--fast-sim", action="store_true", default=True)
-    p.add_argument("--full-sim", action="store_true", help="Use default (slower) physics")
+    p.add_argument(
+        "--fast-sim",
+        action="store_true",
+        help="Use faster/different physics (NOT the UI). Default is UI physics.",
+    )
     p.add_argument("--checkpoint-every", type=int, default=None)
     p.add_argument("--eval-every", type=int, default=None)
     p.add_argument("--eval-games", type=int, default=None)
@@ -101,7 +104,9 @@ def main() -> None:
     if args.learning_rate is not None:
         cfg.learning_rate = args.learning_rate
 
-    sim = SimConfig.default() if args.full_sim else SimConfig.fast()
+    # Match UI/API physics unless --fast-sim is requested.
+    sim = SimConfig.fast() if args.fast_sim else SimConfig.default()
+    sim.goals_to_win = cfg.goals_to_win
     trainer = Trainer(cfg, sim_config=sim, runs_root=args.runs_root)
     if args.resume is not None:
         trainer.resume(args.resume)

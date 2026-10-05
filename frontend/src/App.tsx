@@ -7,6 +7,8 @@ import type { AgentName } from './game/types'
 
 const AGENT_OPTIONS: { value: AgentName; label: string }[] = [
   { value: 'human', label: 'Human' },
+  { value: 'rl', label: 'RL Best' },
+  { value: 'rl-first', label: 'RL First' },
   { value: 'jev', label: 'Jev' },
   { value: 'heuristic', label: 'Heuristic' },
   { value: 'random', label: 'Random' },
@@ -77,7 +79,11 @@ export default function App() {
         <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
           {isAiThinking && (
             <span style={{ color: '#ffd700', fontSize: '14px' }}>
-              Jev is thinking…
+              {teamAAgent !== 'human' && gameState?.current_team === 'A'
+                ? `${agentLabel(teamAAgent)} is thinking…`
+                : teamBAgent !== 'human' && gameState?.current_team === 'B'
+                  ? `${agentLabel(teamBAgent)} is thinking…`
+                  : 'AI is thinking…'}
             </span>
           )}
           <button
@@ -131,8 +137,8 @@ export default function App() {
                 textAlign: 'center',
               }}>
                 Team A ({teamAAgent}) vs Team B ({teamBAgent})
-                {gameState.current_team === 'B' && teamBAgent === 'jev' && ' · Jev to move'}
-                {gameState.current_team === 'A' && teamAAgent === 'jev' && ' · Jev to move'}
+                {gameState.current_team === 'B' && teamBAgent !== 'human' && ` · ${agentLabel(teamBAgent)} to move`}
+                {gameState.current_team === 'A' && teamAAgent !== 'human' && ` · ${agentLabel(teamAAgent)} to move`}
                 {' · '}Space cancels aim
               </div>
 
@@ -188,8 +194,8 @@ export default function App() {
                 Flick Football
               </h2>
               <p style={{ marginBottom: '28px', color: '#aaa', maxWidth: '420px' }}>
-                Turn-based 5v5 physics soccer. Play yourself or let Jev take a side —
-                agents are swappable strategies behind the same API.
+                Turn-based 5v5 physics soccer. Play yourself, face Jev, or test the trained RL agent —
+                strategies are swappable behind the same API.
               </p>
 
               <div style={{
@@ -249,6 +255,10 @@ export default function App() {
       </footer>
     </div>
   )
+}
+
+function agentLabel(name: AgentName): string {
+  return AGENT_OPTIONS.find(o => o.value === name)?.label ?? String(name)
 }
 
 function AgentPicker({

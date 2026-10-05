@@ -43,10 +43,18 @@ class HybridActionDistribution:
     angle under that Normal (standard practical approach for 2D aiming).
     """
 
-    def __init__(self, out: ActionDistOutput) -> None:
+    def __init__(
+        self,
+        out: ActionDistOutput,
+        *,
+        log_std_min: float = -2.0,
+        log_std_max: float = -0.2,
+    ) -> None:
         self.out = out
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
         self.player_dist = Categorical(logits=out.player_logits)
-        log_std = out.angle_log_std.clamp(-5.0, 2.0)
+        log_std = out.angle_log_std.clamp(log_std_min, log_std_max)
         self.angle_dist = Normal(out.angle_mean, log_std.exp())
         # Beta needs positive concentrations
         self.power_dist = Beta(out.power_alpha, out.power_beta)
@@ -77,7 +85,7 @@ class HybridActionDistribution:
         mean = self.out.angle_mean
         delta = _wrap_angle(angle - mean)
         # log prob of (mean + delta) under Normal(mean, std) == log prob of delta under Normal(0,std)
-        std = self.out.angle_log_std.clamp(-5.0, 2.0).exp()
+        std = self.out.angle_log_std.clamp(self.log_std_min, self.log_std_max).exp()
         angle_lp = Normal(torch.zeros_like(mean), std).log_prob(delta)
         power_c = power.clamp(1e-4, 1.0 - 1e-4)
         return (
@@ -101,6 +109,9 @@ def build_dist_from_network(
     player_logits: torch.Tensor,
     direction_params: torch.Tensor,
     power_params: torch.Tensor,
+    *,
+    log_std_min: float = -2.0,
+    log_std_max: float = -0.2,
 ) -> HybridActionDistribution:
     """
     direction_params: (B, 3) -> mean_x, mean_y, log_std
@@ -119,5 +130,7 @@ def build_dist_from_network(
             angle_log_std=angle_log_std,
             power_alpha=alpha,
             power_beta=beta,
-        )
+        ),
+        log_std_min=log_std_min,
+        log_std_max=log_std_max,
     )

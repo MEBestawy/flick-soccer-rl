@@ -68,7 +68,13 @@ def _worker_main(
 
     def _obs_for(team: Team) -> np.ndarray:
         assert env.state is not None
-        return observation_from_state(env.state, team, sim_config, rl_config)
+        return observation_from_state(
+            env.state,
+            team,
+            sim_config,
+            rl_config,
+            search_hint_prob=env._search_hint_prob,
+        )
 
     def _sync_to_learner() -> np.ndarray:
         guard = 0
@@ -123,6 +129,9 @@ def _worker_main(
             if cmd == "reset":
                 _configure_opponent(data["opp"])
                 env._shaping_override = data.get("shaping")
+                gtw = int(data["opp"].get("goals_to_win", rl_config.goals_to_win))
+                mt = int(data["opp"].get("max_turns", rl_config.max_turns_per_game))
+                env.apply_match_rules(gtw, mt)
                 env.reset(seed=data.get("seed"))
                 ep_return = 0.0
                 obs = _sync_to_learner()
@@ -130,6 +139,15 @@ def _worker_main(
             elif cmd == "sync_weights":
                 current_model.load_state_dict(data)
                 current_model.eval()
+                remote.send(True)
+            elif cmd == "set_curriculum":
+                env.rl_config.easy_scenario_prob = float(data.get("easy_prob", 0.0))
+                env._search_hint_prob = float(data.get("search_prob", 0.0))
+                if "teacher_mix" in data and hasattr(current_model, "set_teacher_mix"):
+                    current_model.set_teacher_mix(float(data["teacher_mix"]))
+                    for m in hist_cache.values():
+                        if hasattr(m, "set_teacher_mix"):
+                            m.set_teacher_mix(float(data["teacher_mix"]))
                 remote.send(True)
             elif cmd == "step":
                 env._shaping_override = data.get("shaping")
@@ -156,7 +174,13 @@ def _worker_main(
                             and env.state.current_team != learner_team
                         ):
                             opp_action = opponent.act(env.state, env.state.current_team)
-                            opp_res = env.step(opp_action)
+                            opp_res = env.step(
+                                opp_action,
+                                reward_perspective=learner_team,
+                                include_turn_penalty=False,
+                            )
+                            reward += float(opp_res.reward)
+                            ep_return += float(opp_res.reward)
                             if opp_res.terminated or opp_res.truncated:
                                 done = True
                                 ep_finished = True
@@ -222,6 +246,23 @@ class ParallelFlickEnvs:
         cpu_sd = {k: v.detach().cpu() for k, v in state_dict.items()}
         for remote in self._remotes:
             remote.send(("sync_weights", cpu_sd))
+        for remote in self._remotes:
+            remote.recv()
+
+    def set_curriculum(
+        self,
+        *,
+        easy_prob: float,
+        search_prob: float,
+        teacher_mix: float,
+    ) -> None:
+        payload = {
+            "easy_prob": easy_prob,
+            "search_prob": search_prob,
+            "teacher_mix": teacher_mix,
+        }
+        for remote in self._remotes:
+            remote.send(("set_curriculum", payload))
         for remote in self._remotes:
             remote.recv()
 

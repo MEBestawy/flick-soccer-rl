@@ -1,13 +1,14 @@
-"""Historical opponent checkpoint pool with lazy loading."""
+"""Historical opponent checkpoint pool with Elo-weighted (PfSP-lite) sampling."""
 
 from __future__ import annotations
 
 import json
+import math
 import random
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
 
@@ -15,7 +16,7 @@ from sim.config import SimConfig
 
 from .config import RLConfig
 from .model import ActorCritic
-from .opponents import HeuristicRLOpponent, Opponent, PolicyOpponent, RandomOpponent
+from .opponents import HeuristicRLOpponent, Opponent, PolicyOpponent
 
 
 @dataclass
@@ -75,12 +76,10 @@ class OpponentPool:
         max_n = self.rl_config.max_pool_size
         if len(self.entries) <= max_n:
             return
-        # Keep oldest, newest, and highest Elo
         by_elo = sorted(self.entries, key=lambda e: e.elo, reverse=True)
         keep = {id(self.entries[0]), id(self.entries[-1])}
         for e in by_elo[: max(3, max_n // 3)]:
             keep.add(id(e))
-        # Fill with recent
         for e in reversed(self.entries):
             if len(keep) >= max_n:
                 break
@@ -100,14 +99,38 @@ class OpponentPool:
             self._cache.popitem(last=False)
         return model
 
+    def _sample_historical(self) -> PoolEntry:
+        """Prefer stronger historical opponents (PfSP-lite softmax over Elo)."""
+        assert self.entries
+        temp = max(1e-3, float(self.rl_config.hist_elo_softmax_temp))
+        elos = [e.elo for e in self.entries]
+        max_e = max(elos)
+        weights = [math.exp((e - max_e) / temp) for e in elos]
+        total = sum(weights)
+        r = random.random() * total
+        acc = 0.0
+        for entry, w in zip(self.entries, weights):
+            acc += w
+            if r <= acc:
+                return entry
+        return self.entries[-1]
+
     def sample_opponent(self, step: int, current: ActorCritic) -> Opponent:
         h, hist, curr = self.rl_config.opponent_mix(step)
+        # Renormalize if pool empty (fold hist into current)
+        if not self.entries:
+            hist = 0.0
+            s = h + curr
+            h, curr = (h / s, curr / s) if s > 0 else (0.5, 0.5)
         r = random.random()
         if r < h:
             return HeuristicRLOpponent(self.sim_config, seed=step)
         if r < h + hist and self.entries:
-            entry = random.choice(self.entries)
+            entry = self._sample_historical()
             model = self._load_model(entry.path)
+            # Match current teacher_mix so hist opponents behave consistently
+            if hasattr(current, "teacher_mix"):
+                model.set_teacher_mix(current.teacher_mix)
             return PolicyOpponent(
                 model,
                 self.rl_config,
@@ -125,16 +148,26 @@ class OpponentPool:
         )
 
     def update_elo(self, entry_step: Optional[int], won: bool, drew: bool) -> None:
-        # Simplified: update historical entry if matched
         if entry_step is None:
             return
         for e in self.entries:
             if e.step == entry_step:
                 if drew:
                     e.draws += 1
+                    score = 0.5
                 elif won:
                     e.wins += 1
+                    score = 1.0
                 else:
                     e.losses += 1
+                    score = 0.0
+                # Opponent Elo rises when they beat the learner
+                k = self.rl_config.elo_k
+                expected = 1.0 / (
+                    1.0
+                    + 10
+                    ** ((self.rl_config.elo_initial - e.elo) / 400.0)
+                )
+                e.elo += k * (score - expected)
                 break
         self.save_meta()

@@ -23,12 +23,14 @@ from .prompt import (
 )
 from .random_agent import RandomAgent
 from .registry import available_agents, create_agent, register_agent
+from .rl_agent import RLAgent, resolve_rl_checkpoint, resolve_rl_first_checkpoint
 
 __all__ = [
     "Agent",
     "RandomAgent",
     "HeuristicAgent",
     "JevAgent",
+    "RLAgent",
     "JevClient",
     "JevClientError",
     "MatchRunner",
@@ -37,6 +39,8 @@ __all__ = [
     "create_agent",
     "register_agent",
     "available_agents",
+    "resolve_rl_checkpoint",
+    "resolve_rl_first_checkpoint",
     "build_normalized_observation",
     "observation_to_prompt_text",
     "normalize_position",

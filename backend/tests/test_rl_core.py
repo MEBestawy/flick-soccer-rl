@@ -83,6 +83,7 @@ def test_reward_scoring_and_shaping_sign():
     prev = env.reset(Team.A)
     nxt = prev.clone()
     nxt.score_a = prev.score_a + 1
+    nxt.last_touch_team = Team.A
     # Move ball forward for Team A
     nxt.ball.position = Vec2(prev.ball.position.x + 10.0, prev.ball.position.y)
     cfg = SimConfig.default()

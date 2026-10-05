@@ -146,6 +146,8 @@ def _bind_agents(
             return create_agent(name, team, config)
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (FileNotFoundError, RuntimeError, ImportError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     game_agents[game_id] = GameAgentBinding(
         team_a=maybe_create(a_name, Team.A),
@@ -304,6 +306,8 @@ async def execute_ai_action(
             agent = create_agent(agent_name, state.current_team, sim.config)
             agent_name = agent.name
         except KeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (FileNotFoundError, RuntimeError, ImportError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     elif binding is not None:
         agent = binding.agent_for(state.current_team)

@@ -12,6 +12,7 @@ from .base import Agent
 from .heuristic_agent import HeuristicAgent
 from .jev_agent import JevAgent
 from .random_agent import RandomAgent
+from .rl_agent import RLAgent
 
 AgentFactory = Callable[[Team, Optional[SimConfig]], Agent]
 
@@ -19,6 +20,8 @@ _REGISTRY: Dict[str, AgentFactory] = {
     "random": lambda team, config: RandomAgent(team, config),
     "heuristic": lambda team, config: HeuristicAgent(team, config),
     "jev": lambda team, config: JevAgent(team, config),
+    "rl": lambda team, config: RLAgent(team, config, name="rl"),
+    "rl-first": lambda team, config: RLAgent(team, config, name="rl-first"),
 }
 
 

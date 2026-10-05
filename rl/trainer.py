@@ -30,6 +30,7 @@ from .opponents import HeuristicRLOpponent, Opponent, PolicyOpponent
 from .parallel_env import ParallelFlickEnvs
 from .ppo import ppo_update
 from .replay_export import export_match_replay
+from .bc_bootstrap import behavioral_clone_bootstrap
 
 
 def _git_meta() -> Dict[str, Any]:
@@ -60,8 +61,8 @@ class Trainer:
         runs_root: Optional[Path] = None,
     ) -> None:
         self.rl_config = rl_config or RLConfig()
-        # Fast settling thresholds keep training on CPU/Rosetta practical.
-        self.sim_config = sim_config or SimConfig.fast()
+        # Match UI / API physics (SimConfig.default) unless caller overrides.
+        self.sim_config = sim_config or SimConfig.default()
         self.device = resolve_device(self.rl_config.device)
         self.runs_root = Path(runs_root or Path(__file__).resolve().parents[1] / "runs")
         self.run_dir = self.runs_root / self.rl_config.run_name
@@ -76,6 +77,12 @@ class Trainer:
         self.update = 0
         self.best_elo = self.rl_config.elo_initial
         self.current_elo = self.rl_config.elo_initial
+        self.best_quality = -1e9
+
+        # Align sim first-to-N with early curriculum.
+        gtw, mt = self.rl_config.match_rules_at(0)
+        self.sim_config.goals_to_win = gtw
+        self.rl_config.max_turns_per_game = mt
 
         self.pool = OpponentPool(
             self.run_dir / "opponents",
@@ -84,6 +91,7 @@ class Trainer:
             self.device,
         )
         self.metrics = MetricsLogger(self.run_dir)
+        print(f"Learning curve: {self.metrics.learning_curve_path}")
 
         self._use_parallel = self.rl_config.num_workers >= 2
         self.parallel_envs: Optional[ParallelFlickEnvs] = None
@@ -159,6 +167,9 @@ class Trainer:
         opp = self.pool.sample_opponent(self.global_step, self.model)
         self._opponents[i] = opp
         shaping = self.rl_config.shaping_scale_at(self.global_step)
+        gtw, mt = self.rl_config.match_rules_at(self.global_step)
+        self.sim_config.goals_to_win = gtw
+        self.rl_config.max_turns_per_game = mt
 
         if self._use_parallel:
             assert self.parallel_envs is not None
@@ -171,6 +182,8 @@ class Trainer:
                 self._learner_team[i] = (
                     Team.A if spec.get("learner_team", "A") == "A" else Team.B
                 )
+            spec["goals_to_win"] = gtw
+            spec["max_turns"] = mt
             self._obs[i] = self.parallel_envs.reset_one(i, spec, seed, shaping)
             self._ep_returns[i] = 0.0
             return
@@ -183,6 +196,7 @@ class Trainer:
             both = False
             self._learner_team[i] = Team.A if np.random.rand() < 0.5 else Team.B
         self._both_flags[i] = both
+        self.envs[i].apply_match_rules(gtw, mt)
         obs, _ = self.envs[i].reset(seed=seed)
         # Auto-play until learner to move (unless both)
         self._obs[i] = self._sync_to_learner(i, both)
@@ -193,14 +207,52 @@ class Trainer:
             return self._both_flags[i]
         return self._opponents[i].name == "current"
 
+    def _apply_anneals(self, total: int) -> Dict[str, float]:
+        """Update teacher mix, LR, search/easy probs for the current step."""
+        step = self.global_step
+        mix = self.rl_config.teacher_mix_at(step)
+        lr = self.rl_config.learning_rate_at(step, total)
+        search_p = self.rl_config.search_prob_at(step)
+        easy_p = self.rl_config.easy_prob_at(step)
+        self.model.set_teacher_mix(mix)
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = lr
+        self.rl_config.easy_scenario_prob = easy_p
+        for e in self.envs:
+            e.rl_config.easy_scenario_prob = easy_p
+            e._search_hint_prob = search_p
+            e._shaping_override = self.rl_config.shaping_scale_at(step)
+        if self.parallel_envs is not None:
+            self.parallel_envs.set_curriculum(
+                easy_prob=easy_p,
+                search_prob=search_p,
+                teacher_mix=mix,
+            )
+        return {
+            "train/teacher_mix": mix,
+            "train/learning_rate": lr,
+            "train/search_prob": search_p,
+            "train/easy_prob": easy_p,
+            "train/bc_coef": self.rl_config.bc_coef_at(step),
+            "train/free_bc_coef": self.rl_config.free_bc_coef_at(step),
+            "train/shaping_scale": self.rl_config.shaping_scale_at(step),
+        }
+
+    def _obs_kwargs(self) -> Dict[str, Any]:
+        search_p = 0.0
+        if self.envs:
+            search_p = float(getattr(self.envs[0], "_search_hint_prob", 0.0))
+        return {"search_hint_prob": search_p}
+
     def _sync_to_learner(self, i: int, both: bool) -> np.ndarray:
         env = self.envs[i]
         guard = 0
+        kw = self._obs_kwargs()
         while env.state is not None and guard < 50:
             team = env.state.current_team
             if both or team == self._learner_team[i]:
                 return observation_from_state(
-                    env.state, team, self.sim_config, self.rl_config
+                    env.state, team, self.sim_config, self.rl_config, **kw
                 )
             # Opponent acts
             action = self._opponents[i].act(env.state, team)
@@ -211,7 +263,7 @@ class Trainer:
             guard += 1
         assert env.state is not None
         return observation_from_state(
-            env.state, env.state.current_team, self.sim_config, self.rl_config
+            env.state, env.state.current_team, self.sim_config, self.rl_config, **kw
         )
 
     def _init_envs(self) -> None:
@@ -271,6 +323,8 @@ class Trainer:
         self.parallel_envs.sync_weights(self.model.state_dict())
         ep_rewards: List[float] = []
         ep_lens: List[float] = []
+        forward_fracs: List[float] = []
+        mean_cos: List[float] = []
         tallies = {
             "goals_for": 0.0,
             "goals_against": 0.0,
@@ -293,6 +347,8 @@ class Trainer:
             logps = sample.log_prob.cpu().numpy()
             values = sample.value.cpu().numpy()
             shaping = self.rl_config.shaping_scale_at(self.global_step)
+            forward_fracs.append(float(np.mean(dirs[:, 0] > 0)))
+            mean_cos.append(float(np.mean(dirs[:, 0])))
 
             results = self.parallel_envs.step(players, dirs, powers, shaping)
             rewards = np.zeros(self.rl_config.num_envs, dtype=np.float32)
@@ -351,6 +407,8 @@ class Trainer:
             "game/loss_rate": tallies["losses"] / n if ep_rewards else 0.0,
             "game/goals_for": tallies["goals_for"] / n if ep_rewards else 0.0,
             "game/goals_against": tallies["goals_against"] / n if ep_rewards else 0.0,
+            "policy/forward_frac": float(np.mean(forward_fracs)) if forward_fracs else 0.0,
+            "policy/mean_cos": float(np.mean(mean_cos)) if mean_cos else 0.0,
             "perf/env_steps_per_sec": self.rl_config.rollout_steps
             * self.rl_config.num_envs
             / elapsed,
@@ -360,6 +418,8 @@ class Trainer:
         self.model.train()
         ep_rewards: List[float] = []
         ep_lens: List[float] = []
+        forward_fracs: List[float] = []
+        mean_cos: List[float] = []
         tallies = {
             "goals_for": 0.0,
             "goals_against": 0.0,
@@ -381,6 +441,8 @@ class Trainer:
             dirs = sample.direction_raw.cpu().numpy()
             logps = sample.log_prob.cpu().numpy()
             values = sample.value.cpu().numpy()
+            forward_fracs.append(float(np.mean(dirs[:, 0] > 0)))
+            mean_cos.append(float(np.mean(dirs[:, 0])))
 
             rewards = np.zeros(self.rl_config.num_envs, dtype=np.float32)
             dones = np.zeros(self.rl_config.num_envs, dtype=np.float32)
@@ -419,20 +481,28 @@ class Trainer:
                 else:
                     both = self._both_sides(i)
                     if not both and env.state is not None:
+                        learner = self._learner_team[i]
                         while (
                             env.state is not None
-                            and env.state.current_team != self._learner_team[i]
+                            and env.state.current_team != learner
                         ):
+                            prev_opp = env.state.clone()
                             opp_action = self._opponents[i].act(
                                 env.state, env.state.current_team
                             )
-                            opp_res = env.step(opp_action)
+                            opp_res = env.step(
+                                opp_action,
+                                reward_perspective=learner,
+                                include_turn_penalty=False,
+                            )
+                            rewards[i] += opp_res.reward
+                            self._ep_returns[i] += opp_res.reward
                             if opp_res.terminated or opp_res.truncated:
                                 st = env.state
                                 assert st is not None
                                 self._record_episode_outcome(
                                     both=False,
-                                    team=self._learner_team[i],
+                                    team=learner,
                                     score_a=st.score_a,
                                     score_b=st.score_b,
                                     ep_reward=float(self._ep_returns[i]),
@@ -444,10 +514,16 @@ class Trainer:
                                 dones[i] = 1.0
                                 self._reset_env(i)
                                 break
+                            # prev_opp unused but keeps intent clear for credit path
+                            _ = prev_opp
                     if env.state is not None and dones[i] == 0:
                         team = env.state.current_team
                         self._obs[i] = observation_from_state(
-                            env.state, team, self.sim_config, self.rl_config
+                            env.state,
+                            team,
+                            self.sim_config,
+                            self.rl_config,
+                            **self._obs_kwargs(),
                         )
 
             buffer.add(
@@ -478,6 +554,8 @@ class Trainer:
             "game/loss_rate": tallies["losses"] / n if ep_rewards else 0.0,
             "game/goals_for": tallies["goals_for"] / n if ep_rewards else 0.0,
             "game/goals_against": tallies["goals_against"] / n if ep_rewards else 0.0,
+            "policy/forward_frac": float(np.mean(forward_fracs)) if forward_fracs else 0.0,
+            "policy/mean_cos": float(np.mean(mean_cos)) if mean_cos else 0.0,
             "perf/env_steps_per_sec": self.rl_config.rollout_steps
             * self.rl_config.num_envs
             / elapsed,
@@ -491,26 +569,68 @@ class Trainer:
         print(
             f"Training {self.rl_config.run_name} on {self.device} | "
             f"params={self.model.parameter_count()} | envs={self.rl_config.num_envs} | "
-            f"workers={workers}"
+            f"workers={workers} | goals_to_win={self.sim_config.goals_to_win} | "
+            f"max_turns={self.rl_config.max_turns_per_game}"
         )
 
+        if self.global_step == 0 and self.rl_config.bc_bootstrap_updates > 0:
+            print(
+                f"BC bootstrap from heuristic "
+                f"({self.rl_config.bc_bootstrap_updates} updates)..."
+            )
+            bc_stats = behavioral_clone_bootstrap(
+                self.model,
+                self.optimizer,
+                rl_config=self.rl_config,
+                sim_config=self.sim_config,
+                device=self.device,
+                updates=self.rl_config.bc_bootstrap_updates,
+                batch_size=self.rl_config.bc_bootstrap_batch,
+            )
+            self.metrics.log(0, {f"bc/{k}": v for k, v in bc_stats.items()})
+            # Refresh workers with cloned weights and reset env obs.
+            if self.parallel_envs is not None:
+                self.parallel_envs.sync_weights(self.model.state_dict())
+            for i in range(self.rl_config.num_envs):
+                self._reset_env(i, seed=self.rl_config.seed + i)
+            self._evaluate_and_maybe_best()
+
         while self.global_step < total:
+            anneal_stats = self._apply_anneals(total)
             buffer.reset()
-            # refresh shaping on envs
-            for e in self.envs:
-                e._shaping_override = self.rl_config.shaping_scale_at(self.global_step)
 
             roll_stats = self.collect_rollout(buffer)
             batch = buffer.get(self.device)
             t0 = time.time()
-            ppo_stats = ppo_update(self.model, self.optimizer, batch, self.rl_config)
+            ppo_stats = ppo_update(
+                self.model,
+                self.optimizer,
+                batch,
+                self.rl_config,
+                bc_coef=self.rl_config.bc_coef_at(self.global_step),
+                free_bc_coef=self.rl_config.free_bc_coef_at(self.global_step),
+            )
             ppo_time = time.time() - t0
             self.update += 1
+
+            if (
+                self.global_step < self.rl_config.bc_aux_until_steps
+                and self.rl_config.bc_aux_updates > 0
+            ):
+                behavioral_clone_bootstrap(
+                    self.model,
+                    self.optimizer,
+                    rl_config=self.rl_config,
+                    sim_config=self.sim_config,
+                    device=self.device,
+                    updates=self.rl_config.bc_aux_updates,
+                    batch_size=self.rl_config.bc_bootstrap_batch,
+                )
 
             stats = {
                 **{f"train/{k}": v for k, v in ppo_stats.items() if k != "n_updates"},
                 **roll_stats,
-                "train/learning_rate": self.rl_config.learning_rate,
+                **anneal_stats,
                 "perf/ppo_update_sec": ppo_time,
                 "eval/elo": self.current_elo,
             }
@@ -521,9 +641,11 @@ class Trainer:
                 f"SPS {roll_stats['perf/env_steps_per_sec']:.0f}  "
                 f"Reward {roll_stats['game/reward']:+.3f}  "
                 f"Win {roll_stats['game/win_rate']:.0%}  "
+                f"GF {roll_stats['game/goals_for']:.2f}  "
+                f"Fwd {roll_stats.get('policy/forward_frac', 0):.0%}  "
+                f"Mix {anneal_stats['train/teacher_mix']:.2f}  "
                 f"Entropy {ppo_stats['entropy']:.2f}  "
-                f"Elo {self.current_elo:.0f}  "
-                f"Best {self.best_elo:.0f}"
+                f"Qbest {self.best_quality:.2f}"
             )
 
             if self.global_step % self.rl_config.pool_snapshot_every < (
@@ -573,35 +695,70 @@ class Trainer:
 
     def _evaluate_and_maybe_best(self) -> None:
         self.model.eval()
-        heur = HeuristicRLOpponent(self.sim_config, noise=0.05)
-        stats = evaluate_vs_opponent(
-            self.model,
-            heur,
-            rl_config=self.rl_config,
-            sim_config=self.sim_config,
-            games=self.rl_config.eval_games,
-            seeds=self.rl_config.eval_seeds,
-        )
-        # Elo vs heuristic baseline 1000
+        heur = HeuristicRLOpponent(self.sim_config, noise=0.0)
+        current_mix = float(self.model.teacher_mix)
+
+        def _run(mix: float) -> Dict[str, float]:
+            self.model.set_teacher_mix(mix)
+            return evaluate_vs_opponent(
+                self.model,
+                heur,
+                rl_config=self.rl_config,
+                sim_config=self.sim_config,
+                games=self.rl_config.eval_games,
+                seeds=self.rl_config.eval_seeds,
+            )
+
+        stats = _run(current_mix)
+        if current_mix < 1e-6:
+            stats_free = stats
+        else:
+            stats_free = _run(0.0)
+            self.model.set_teacher_mix(current_mix)
+
         score = stats["win_rate"] + 0.5 * stats["draw_rate"]
         self.current_elo, _ = update_elo(
             self.current_elo, self.rl_config.elo_initial, score, self.rl_config.elo_k
         )
+
+        def _quality(s: Dict[str, float]) -> float:
+            return (
+                5.0 * s["goals_on_policy_turn"]
+                + 0.5 * s["goal_diff"]
+                + 0.25 * s["win_rate"]
+                - 1.0 * s["goals_on_opp_turn"]
+            )
+
+        quality = _quality(stats)
+        quality_free = _quality(stats_free)
+        # Always select on free-policy quality (transferable skill).
+        select_q = quality_free
         self.metrics.log(
             self.global_step,
             {
                 "eval/win_rate_heuristic": stats["win_rate"],
                 "eval/goal_diff": stats["goal_diff"],
                 "eval/avg_turns": stats["avg_turns"],
+                "eval/goals_on_policy_turn": stats["goals_on_policy_turn"],
+                "eval/goals_on_opp_turn": stats["goals_on_opp_turn"],
+                "eval/quality": quality,
+                "eval/quality_free": quality_free,
+                "eval/polG_free": stats_free["goals_on_policy_turn"],
+                "eval/win_rate_free": stats_free["win_rate"],
                 "eval/elo": self.current_elo,
+                "eval/teacher_mix": current_mix,
             },
         )
         print(
-            f"  Eval vs heuristic: win={stats['win_rate']:.0%}  "
-            f"GD={stats['goal_diff']:+.2f}  Elo={self.current_elo:.0f}"
+            f"  Eval mix={current_mix:.2f}: win={stats['win_rate']:.0%}  "
+            f"polG={stats['goals_on_policy_turn']:.2f}  Q={quality:.2f} | "
+            f"free: win={stats_free['win_rate']:.0%}  "
+            f"polG={stats_free['goals_on_policy_turn']:.2f}  "
+            f"Qfree={quality_free:.2f}  Elo={self.current_elo:.0f}"
         )
-        if self.current_elo > self.best_elo + 5:
-            self.best_elo = self.current_elo
+        if select_q > self.best_quality + 0.05:
+            self.best_quality = select_q
+            self.best_elo = max(self.best_elo, self.current_elo)
             save_checkpoint(
                 self.ckpt_dir / "best.pt",
                 model=self.model,
@@ -610,8 +767,16 @@ class Trainer:
                 global_step=self.global_step,
                 update=self.update,
                 best_elo=self.best_elo,
+                extra={
+                    "eval_quality": quality,
+                    "eval_quality_free": quality_free,
+                    "teacher_mix": current_mix,
+                },
             )
-            print(f"  New best.pt (Elo {self.best_elo:.0f})")
+            print(
+                f"  New best.pt (select_q {select_q:.2f}, "
+                f"mixQ={quality:.2f}, freeQ={quality_free:.2f})"
+            )
 
     def _export_replays(self) -> None:
         self.model.eval()

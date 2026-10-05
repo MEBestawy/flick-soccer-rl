@@ -145,9 +145,27 @@ def test_create_agent_registry() -> None:
     assert "random" in available_agents()
     assert "heuristic" in available_agents()
     assert "jev" in available_agents()
+    assert "rl" in available_agents()
     agent = create_agent("random", Team.A)
     assert isinstance(agent, RandomAgent)
     assert agent.team == Team.A
+
+
+def test_rl_agent_loads_best_checkpoint() -> None:
+    pytest.importorskip("torch")
+    from sim.agents import RLAgent, resolve_rl_checkpoint
+
+    try:
+        ckpt = resolve_rl_checkpoint()
+    except FileNotFoundError:
+        pytest.skip("No trained best.pt available")
+
+    env = HeadlessEnv()
+    state = env.reset(Team.A)
+    agent = RLAgent(Team.A, checkpoint=str(ckpt))
+    action = agent.select_action(state)
+    assert action.is_valid(state)
+    assert agent.name == "rl"
 
 
 def test_register_custom_agent() -> None:

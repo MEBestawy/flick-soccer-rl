@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 from pathlib import Path
 
@@ -12,49 +11,7 @@ from _rl_path import setup_paths
 
 ROOT = setup_paths()
 
-
-def load_metrics(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    with path.open() as f:
-        return list(csv.DictReader(f))
-
-
-def series(rows: list[dict], key: str) -> list[tuple[int, float]]:
-    out = []
-    for r in rows:
-        if key not in r or r[key] in ("", None):
-            continue
-        try:
-            out.append((int(float(r["step"])), float(r[key])))
-        except (ValueError, KeyError):
-            continue
-    return out
-
-
-def sparkline_svg(points: list[tuple[int, float]], w: int = 640, h: int = 120) -> str:
-    if len(points) < 2:
-        return f'<svg width="{w}" height="{h}"></svg>'
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    xmin, xmax = min(xs), max(xs)
-    ymin, ymax = min(ys), max(ys)
-    if xmax == xmin:
-        xmax = xmin + 1
-    if ymax == ymin:
-        ymax = ymin + 1.0
-
-    def px(x: float, y: float) -> str:
-        X = (x - xmin) / (xmax - xmin) * (w - 20) + 10
-        Y = h - 10 - (y - ymin) / (ymax - ymin) * (h - 20)
-        return f"{X:.1f},{Y:.1f}"
-
-    poly = " ".join(px(x, y) for x, y in points)
-    return (
-        f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
-        f'<polyline fill="none" stroke="#1a5f2a" stroke-width="2" points="{poly}"/>'
-        f"</svg>"
-    )
+from rl.learning_curve import load_metrics_rows, write_learning_curve
 
 
 def main() -> None:
@@ -65,29 +22,18 @@ def main() -> None:
     report_dir = run / "report"
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = load_metrics(run / "metrics.csv")
-    charts = [
-        ("eval/elo", "Elo"),
-        ("eval/win_rate_heuristic", "Win rate vs heuristic"),
-        ("game/reward", "Episode reward"),
-        ("train/entropy", "Entropy"),
-        ("perf/env_steps_per_sec", "Env steps/sec"),
-        ("eval/goal_diff", "Goal differential"),
-    ]
+    rows = load_metrics_rows(run / "metrics.csv")
+    curve_path = write_learning_curve(run)
 
-    sections = []
-    for key, title in charts:
-        pts = series(rows, key)
-        if not pts:
-            continue
-        sections.append(
-            f"<section><h2>{title}</h2>{sparkline_svg(pts)}"
-            f"<p>Last: {pts[-1][1]:.4f} @ step {pts[-1][0]}</p></section>"
-        )
+    # Keep a snapshot copy inside report/ for archival browsing.
+    snapshot = report_dir / "learning_curve.html"
+    snapshot.write_text(curve_path.read_text(encoding="utf-8"), encoding="utf-8")
 
-    replays = sorted((run / "replays").glob("**/*.json")) if (run / "replays").exists() else []
+    replays = (
+        sorted((run / "replays").glob("**/*.json")) if (run / "replays").exists() else []
+    )
     replay_links = "".join(
-        f"<li><a href=\"../{r.relative_to(run)}\">{r.relative_to(run)}</a></li>"
+        f'<li><a href="../{r.relative_to(run)}">{r.relative_to(run)}</a></li>'
         for r in replays[:30]
     )
 
@@ -100,12 +46,19 @@ def main() -> None:
 body {{ font-family: Georgia, serif; margin: 2rem; background: #f7f5f0; color: #1c1c1c; }}
 h1 {{ font-size: 1.8rem; }}
 section {{ margin: 1.5rem 0; padding-bottom: 1rem; border-bottom: 1px solid #ccc; }}
-svg {{ background: #fff; border: 1px solid #ddd; }}
+a {{ color: #1a5f2a; }}
 code {{ font-size: 0.85rem; }}
 </style></head><body>
 <h1>Training report: {run.name}</h1>
 <p>Metrics rows: {len(rows)} · Replays: {len(replays)}</p>
-{''.join(sections)}
+<section>
+  <h2>Learning curve</h2>
+  <p>Live chart (auto-refreshes during training):
+    <a href="../learning_curve.html">learning_curve.html</a>
+  </p>
+  <p>Snapshot: <a href="learning_curve.html">report/learning_curve.html</a></p>
+  <iframe src="learning_curve.html" style="width:100%;height:920px;border:1px solid #ccc;border-radius:8px;background:#fff"></iframe>
+</section>
 <section><h2>Replays</h2><ul>{replay_links or '<li>None yet</li>'}</ul></section>
 <section><h2>Config (truncated)</h2><pre><code>{cfg_snip}</code></pre></section>
 </body></html>
@@ -117,6 +70,7 @@ code {{ font-size: 0.85rem; }}
         "metric_rows": len(rows),
         "replays": len(replays),
         "report": str(out),
+        "learning_curve": str(curve_path),
     }
     (report_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))

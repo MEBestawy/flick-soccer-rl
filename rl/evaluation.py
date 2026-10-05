@@ -28,6 +28,8 @@ class MatchResult:
     winner: Optional[str]
     actions: List[Dict]
     seed: int
+    goals_on_policy_turn: int = 0
+    goals_on_opp_turn: int = 0
 
 
 def _elo_expected(ra: float, rb: float) -> float:
@@ -53,16 +55,27 @@ def play_match(
     record: bool = False,
 ) -> MatchResult:
     env = FlickRLEnv(sim_config, rl_config)
-    obs, _ = env.reset(seed=seed)
+    env.apply_match_rules(sim_config.goals_to_win, rl_config.max_turns_per_game)
+    # Never use training easy-scenarios / search labels during evaluation.
+    env.rl_config.easy_scenario_prob = 0.0
+    env._search_hint_prob = 0.0
+    env.reset(seed=seed)
     actions: List[Dict] = []
-    # Force starting team somehow — reset randomizes; re-reset until policy_team or just play
-    # For fairness use seed-derived start already in env.reset
+    goals_on_policy_turn = 0
+    goals_on_opp_turn = 0
 
     while True:
         assert env.state is not None
         team = env.state.current_team
+        prev_a, prev_b = env.state.score_a, env.state.score_b
         if team == policy_team:
-            o = observation_from_state(env.state, team, sim_config, rl_config)
+            o = observation_from_state(
+                env.state,
+                team,
+                sim_config,
+                rl_config,
+                search_hint_prob=0.0,
+            )
             action = policy.act_numpy(o, deterministic=deterministic)
         else:
             action = opponent.act(env.state, team)
@@ -79,22 +92,34 @@ def play_match(
             )
 
         result = env.step(action)
-        obs = result.obs
+        st = env.state
+        assert st is not None
+        da = st.score_a - prev_a
+        db = st.score_b - prev_b
+        if team == policy_team:
+            scored = da if policy_team == Team.A else db
+            if scored > 0:
+                goals_on_policy_turn += scored
+        else:
+            # Goals for either side on opponent's turn.
+            goals_on_opp_turn += da + db
+
         if result.terminated or result.truncated:
-            st = env.state
-            assert st is not None
             winner = None
             w = st.winner(sim_config.goals_to_win)
             if w is not None:
                 winner = w.value
-            return MatchResult(
+            m = MatchResult(
                 score_a=st.score_a,
                 score_b=st.score_b,
                 turns=result.info.get("turns", 0),
                 winner=winner,
                 actions=actions,
                 seed=seed,
+                goals_on_policy_turn=goals_on_policy_turn,
+                goals_on_opp_turn=goals_on_opp_turn,
             )
+            return m
 
 
 def evaluate_vs_opponent(
@@ -111,6 +136,8 @@ def evaluate_vs_opponent(
     wins = draws = losses = 0
     gf = ga = 0
     turns = 0
+    goals_on_policy = 0
+    goals_on_opp = 0
     for i in range(games):
         seed = seeds[i % len(seeds)]
         # Alternate sides
@@ -131,6 +158,8 @@ def evaluate_vs_opponent(
         gf += my_s
         ga += opp_s
         turns += m.turns
+        goals_on_policy += m.goals_on_policy_turn
+        goals_on_opp += m.goals_on_opp_turn
         if my_s > opp_s:
             wins += 1
         elif my_s < opp_s:
@@ -147,4 +176,6 @@ def evaluate_vs_opponent(
         "goals_against": ga / n,
         "goal_diff": (gf - ga) / n,
         "avg_turns": turns / n,
+        "goals_on_policy_turn": goals_on_policy / n,
+        "goals_on_opp_turn": goals_on_opp / n,
     }
