@@ -22,6 +22,7 @@ from .rules import (
 )
 from .events import GameEvent, EventLog, EventType
 from .formations import get_kickoff_positions
+from . import rust_bridge
 
 
 class GameSimulator:
@@ -203,12 +204,6 @@ class GameSimulator:
         if player is None:
             return []
         
-        self.physics.launch_player(
-            player,
-            action.normalized_direction(),
-            action.power
-        )
-        
         # Log flick event
         event_log.add(GameEvent.flick(
             action.player_id,
@@ -226,8 +221,56 @@ class GameSimulator:
         state.last_touch_team = player.team
         state.last_touch_player = player.id
         
-        # Frame capture
         frames: List[Frame] = []
+        sim_time = 0.0
+        goal_scored = False
+        scoring_team = None
+        log_events = capture_frames  # RL path skips event spam
+
+        # Fast Rust path (no frame capture). Same physics/rules outcomes.
+        if rust_bridge._rust_enabled() and not capture_frames:
+            rust_result = rust_bridge.rust_simulate_flick(state, action, self.arena, config)
+            if rust_result is not None:
+                sim_time, scoring_team, _ = rust_result
+                goal_scored = scoring_team is not None
+                if goal_scored and scoring_team is not None:
+                    handle_goal(
+                        state, scoring_team, self.arena, config, event_log, sim_time
+                    )
+                else:
+                    event_log.add(GameEvent.all_at_rest(sim_time))
+                # Fall through to post-simulation state handling
+                if goal_scored:
+                    if check_game_over(state, config):
+                        winner = get_winner(state, config)
+                        state.phase = GamePhase.GAME_OVER
+                        event_log.add(GameEvent.match_end(
+                            winner, state.score_a, state.score_b
+                        ))
+                    else:
+                        reset_after_goal(state, self.arena, config)
+                        state.phase = GamePhase.KICKOFF
+                        event_log.add(GameEvent.turn_start(
+                            state.current_team, state.turn_number
+                        ))
+                else:
+                    event_log.add(GameEvent.turn_end(
+                        state.current_team, state.turn_number
+                    ))
+                    advance_turn(state)
+                    state.phase = GamePhase.AIMING
+                    event_log.add(GameEvent.turn_start(
+                        state.current_team, state.turn_number
+                    ))
+                return frames
+
+        self.physics.launch_player(
+            player,
+            action.normalized_direction(),
+            action.power
+        )
+        
+        # Frame capture
         frame_interval = 1.0 / config.frame_capture_rate
         next_frame_time = 0.0
         
@@ -236,8 +279,6 @@ class GameSimulator:
         
         # Simulation loop
         max_sim_time = config.max_simulation_time
-        sim_time = 0.0
-        goal_scored = False
         
         while sim_time < max_sim_time:
             # Compute substeps for fast objects
@@ -254,13 +295,14 @@ class GameSimulator:
             for _ in range(substeps):
                 # Step physics
                 self.physics.step_ball(state.ball, sub_dt)
-                for player in state.players:
-                    self.physics.step_player(player, sub_dt)
+                for p in state.players:
+                    self.physics.step_player(p, sub_dt)
                 
                 # Resolve collisions
                 collisions = resolve_all_collisions(
                     state.ball, state.players, self.arena,
-                    physics_config, event_log, sim_time
+                    physics_config, event_log, sim_time,
+                    log_events=log_events,
                 )
                 
                 # Track ball touches

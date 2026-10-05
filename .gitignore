@@ -19,3 +19,6 @@ json_cache.json
 runs/
 *.pt
 *.pth
+
+# Rust build artifacts
+backend/native/**/target/

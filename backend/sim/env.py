@@ -63,10 +63,13 @@ class HeadlessEnv:
         Returns:
             Initial game state
         """
-        self._state = self.simulator.new_game(starting_team)
+        # new_game returns a clone; bind the live simulator state so mutations
+        # (e.g. RL easy scenarios) affect physics.
+        self.simulator.new_game(starting_team)
+        self._state = self.simulator._state
         self._done = False
         self._turn_count = 0
-        return self._state.clone()
+        return self._state
     
     def step(self, action: FlickAction) -> Tuple[GameState, float, bool, Dict[str, Any]]:
         """
@@ -106,20 +109,22 @@ class HeadlessEnv:
         if final_state is None:
             raise RuntimeError("Action succeeded but no final state returned")
         
-        self._state = final_state
+        # Share live simulator state (result.final_state is a clone).
+        self._state = self.simulator._state
         self._turn_count += 1
+        live = self._state
         
         # Calculate reward (from perspective of acting team)
         reward = 0.0
         if acting_team == Team.A:
-            reward += (final_state.score_a - old_score_a)
-            reward -= (final_state.score_b - old_score_b)
+            reward += (live.score_a - old_score_a)
+            reward -= (live.score_b - old_score_b)
         else:
-            reward += (final_state.score_b - old_score_b)
-            reward -= (final_state.score_a - old_score_a)
+            reward += (live.score_b - old_score_b)
+            reward -= (live.score_a - old_score_a)
         
         # Check if done
-        self._done = final_state.phase == GamePhase.GAME_OVER
+        self._done = live.phase == GamePhase.GAME_OVER
         
         info = {
             "valid": True,
@@ -128,7 +133,7 @@ class HeadlessEnv:
             "simulation_time": result.simulated_time,
         }
         
-        return final_state.clone(), reward, self._done, info
+        return live, reward, self._done, info
     
     def is_done(self) -> bool:
         """Check if game is over."""

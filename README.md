@@ -61,10 +61,16 @@ A browser-based turn-based 5-vs-5 physics soccer game (flick football). Players 
 cd backend
 uv sync
 
+# Optional but strongly recommended for RL throughput: Rust physics (~30–300× SPS)
+# Requires rustup (https://rustup.rs) and maturin (`pip install maturin`)
+../scripts/build_physics.sh
+
 # Frontend
 cd ../frontend
 npm install
 ```
+
+Set `FLICK_PHYSICS_RUST=0` to force the pure-Python physics path (parity / debugging).
 
 ### Running the Game
 
