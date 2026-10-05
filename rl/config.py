@@ -40,6 +40,8 @@ class RLConfig:
 
     # Training
     num_envs: int = 8
+    # 0/1 = in-process sequential envs; >=2 = subprocess workers (one per env).
+    num_workers: int = 0
     total_steps: int = 1_000_000
     seed: int = 42
     device: str = "auto"  # auto | cpu | mps

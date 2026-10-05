@@ -114,6 +114,7 @@ class OpponentPool:
                 self.sim_config,
                 deterministic=False,
                 label=f"hist_{entry.step}",
+                checkpoint_path=entry.path,
             )
         return PolicyOpponent(
             current,

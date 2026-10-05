@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import atexit
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -24,7 +26,8 @@ from .metrics import MetricsLogger
 from .model import ActorCritic
 from .observations import observation_from_state
 from .opponent_pool import OpponentPool
-from .opponents import HeuristicRLOpponent, Opponent
+from .opponents import HeuristicRLOpponent, Opponent, PolicyOpponent
+from .parallel_env import ParallelFlickEnvs
 from .ppo import ppo_update
 from .replay_export import export_match_replay
 
@@ -82,13 +85,26 @@ class Trainer:
         )
         self.metrics = MetricsLogger(self.run_dir)
 
-        self.envs = [
-            FlickRLEnv(self.sim_config, self.rl_config) for _ in range(self.rl_config.num_envs)
-        ]
+        self._use_parallel = self.rl_config.num_workers >= 2
+        self.parallel_envs: Optional[ParallelFlickEnvs] = None
+        self.envs: List[FlickRLEnv] = []
+        if self._use_parallel:
+            # Keep main-process torch from oversubscribing against env workers.
+            torch.set_num_threads(max(1, min(4, (os.cpu_count() or 4) // 2)))
+            self.parallel_envs = ParallelFlickEnvs(
+                self.rl_config.num_envs, self.sim_config, self.rl_config
+            )
+            atexit.register(self.parallel_envs.close)
+        else:
+            self.envs = [
+                FlickRLEnv(self.sim_config, self.rl_config)
+                for _ in range(self.rl_config.num_envs)
+            ]
         self._opponents: List[Opponent] = []
         self._learner_team: List[Team] = []
         self._obs: List[np.ndarray] = []
         self._ep_returns = np.zeros(self.rl_config.num_envs, dtype=np.float32)
+        self._both_flags = [False] * self.rl_config.num_envs
 
         save_config_json(
             self.run_dir / "config.json",
@@ -98,6 +114,7 @@ class Trainer:
                 "goals_to_win": self.sim_config.goals_to_win,
                 "model_params": self.model.parameter_count(),
                 "device": str(self.device),
+                "parallel_workers": self.rl_config.num_workers if self._use_parallel else 0,
                 **_git_meta(),
             },
         )
@@ -115,9 +132,49 @@ class Trainer:
             f"best_elo={self.best_elo:.1f}"
         )
 
+    def _opp_to_spec(self, opp: Opponent) -> Dict[str, Any]:
+        if opp.name == "heuristic":
+            team = Team.A if np.random.rand() < 0.5 else Team.B
+            return {"kind": "heuristic", "learner_team": team.value}
+        if opp.name == "current":
+            return {"kind": "current"}
+        if isinstance(opp, PolicyOpponent) and opp.checkpoint_path:
+            team = Team.A if np.random.rand() < 0.5 else Team.B
+            step = 0
+            if opp.name.startswith("hist_"):
+                try:
+                    step = int(opp.name.split("_", 1)[1])
+                except ValueError:
+                    step = 0
+            return {
+                "kind": "hist",
+                "path": opp.checkpoint_path,
+                "step": step,
+                "learner_team": team.value,
+            }
+        # Fallback: treat unknown policy labels as current self-play
+        return {"kind": "current"}
+
     def _reset_env(self, i: int, seed: Optional[int] = None) -> None:
         opp = self.pool.sample_opponent(self.global_step, self.model)
         self._opponents[i] = opp
+        shaping = self.rl_config.shaping_scale_at(self.global_step)
+
+        if self._use_parallel:
+            assert self.parallel_envs is not None
+            spec = self._opp_to_spec(opp)
+            both = spec["kind"] == "current"
+            self._both_flags[i] = both
+            if both:
+                self._learner_team[i] = Team.A
+            else:
+                self._learner_team[i] = (
+                    Team.A if spec.get("learner_team", "A") == "A" else Team.B
+                )
+            self._obs[i] = self.parallel_envs.reset_one(i, spec, seed, shaping)
+            self._ep_returns[i] = 0.0
+            return
+
         # When opponent is current policy, learn from both sides
         if opp.name == "current":
             self._learner_team[i] = Team.A  # unused flag: both
@@ -125,12 +182,15 @@ class Trainer:
         else:
             both = False
             self._learner_team[i] = Team.A if np.random.rand() < 0.5 else Team.B
+        self._both_flags[i] = both
         obs, _ = self.envs[i].reset(seed=seed)
         # Auto-play until learner to move (unless both)
         self._obs[i] = self._sync_to_learner(i, both)
         self._ep_returns[i] = 0.0
 
     def _both_sides(self, i: int) -> bool:
+        if self._use_parallel:
+            return self._both_flags[i]
         return self._opponents[i].name == "current"
 
     def _sync_to_learner(self, i: int, both: bool) -> np.ndarray:
@@ -162,12 +222,151 @@ class Trainer:
         for i in range(n):
             self._reset_env(i, seed=self.rl_config.seed + i)
 
+    def _record_episode_outcome(
+        self,
+        *,
+        both: bool,
+        team: Team,
+        score_a: int,
+        score_b: int,
+        ep_reward: float,
+        ep_turns: float,
+        ep_rewards: List[float],
+        ep_lens: List[float],
+        tallies: Dict[str, float],
+    ) -> None:
+        if both:
+            if score_a > score_b:
+                tallies["wins"] += 0.5
+                tallies["losses"] += 0.5
+            elif score_b > score_a:
+                tallies["wins"] += 0.5
+                tallies["losses"] += 0.5
+            else:
+                tallies["draws"] += 1
+            tallies["goals_for"] += (score_a + score_b) / 2
+            tallies["goals_against"] += (score_a + score_b) / 2
+        else:
+            my = score_a if team == Team.A else score_b
+            opp = score_b if team == Team.A else score_a
+            tallies["goals_for"] += my
+            tallies["goals_against"] += opp
+            if my > opp:
+                tallies["wins"] += 1
+            elif my < opp:
+                tallies["losses"] += 1
+            else:
+                tallies["draws"] += 1
+        ep_rewards.append(ep_reward)
+        ep_lens.append(ep_turns)
+
     def collect_rollout(self, buffer: RolloutBuffer) -> Dict[str, float]:
+        if self._use_parallel:
+            return self._collect_rollout_parallel(buffer)
+        return self._collect_rollout_serial(buffer)
+
+    def _collect_rollout_parallel(self, buffer: RolloutBuffer) -> Dict[str, float]:
+        assert self.parallel_envs is not None
+        self.model.train()
+        self.parallel_envs.sync_weights(self.model.state_dict())
+        ep_rewards: List[float] = []
+        ep_lens: List[float] = []
+        tallies = {
+            "goals_for": 0.0,
+            "goals_against": 0.0,
+            "wins": 0.0,
+            "losses": 0.0,
+            "draws": 0.0,
+        }
+        t0 = time.time()
+
+        for _t in range(self.rl_config.rollout_steps):
+            obs_batch = np.stack(self._obs, axis=0)
+            obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device)
+            with torch.no_grad():
+                sample = self.model.act(obs_t, deterministic=False)
+
+            players = sample.player.cpu().numpy()
+            angles = sample.angle.cpu().numpy()
+            powers = sample.power.cpu().numpy()
+            dirs = sample.direction_raw.cpu().numpy()
+            logps = sample.log_prob.cpu().numpy()
+            values = sample.value.cpu().numpy()
+            shaping = self.rl_config.shaping_scale_at(self.global_step)
+
+            results = self.parallel_envs.step(players, dirs, powers, shaping)
+            rewards = np.zeros(self.rl_config.num_envs, dtype=np.float32)
+            dones = np.zeros(self.rl_config.num_envs, dtype=np.float32)
+
+            for i, result in enumerate(results):
+                rewards[i] = result.reward
+                dones[i] = result.done
+                self._ep_returns[i] += result.reward
+                self.global_step += 1
+                self._obs[i] = result.obs
+                self._both_flags[i] = result.both
+                self._learner_team[i] = (
+                    Team.A if result.learner_team == "A" else Team.B
+                )
+
+                if result.ep_finished:
+                    self._record_episode_outcome(
+                        both=result.both,
+                        team=self._learner_team[i],
+                        score_a=result.score_a,
+                        score_b=result.score_b,
+                        ep_reward=float(self._ep_returns[i]),
+                        ep_turns=result.ep_turns,
+                        ep_rewards=ep_rewards,
+                        ep_lens=ep_lens,
+                        tallies=tallies,
+                    )
+                    self._reset_env(i)
+
+            buffer.add(
+                obs_batch,
+                players,
+                angles,
+                powers,
+                logps,
+                rewards,
+                dones,
+                values,
+            )
+
+        obs_batch = np.stack(self._obs, axis=0)
+        obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            last_values = self.model.act(obs_t).value.cpu().numpy()
+        last_dones = np.zeros(self.rl_config.num_envs, dtype=np.float32)
+        buffer.compute_gae(last_values, last_dones)
+
+        elapsed = max(1e-6, time.time() - t0)
+        n = max(1, len(ep_rewards))
+        return {
+            "game/reward": float(np.mean(ep_rewards)) if ep_rewards else 0.0,
+            "game/length": float(np.mean(ep_lens)) if ep_lens else 0.0,
+            "game/win_rate": tallies["wins"] / n if ep_rewards else 0.0,
+            "game/draw_rate": tallies["draws"] / n if ep_rewards else 0.0,
+            "game/loss_rate": tallies["losses"] / n if ep_rewards else 0.0,
+            "game/goals_for": tallies["goals_for"] / n if ep_rewards else 0.0,
+            "game/goals_against": tallies["goals_against"] / n if ep_rewards else 0.0,
+            "perf/env_steps_per_sec": self.rl_config.rollout_steps
+            * self.rl_config.num_envs
+            / elapsed,
+        }
+
+    def _collect_rollout_serial(self, buffer: RolloutBuffer) -> Dict[str, float]:
         self.model.train()
         ep_rewards: List[float] = []
         ep_lens: List[float] = []
-        goals_for = goals_against = 0
-        wins = losses = draws = 0
+        tallies = {
+            "goals_for": 0.0,
+            "goals_against": 0.0,
+            "wins": 0.0,
+            "losses": 0.0,
+            "draws": 0.0,
+        }
         t0 = time.time()
 
         for _t in range(self.rl_config.rollout_steps):
@@ -189,13 +388,11 @@ class Trainer:
             for i in range(self.rl_config.num_envs):
                 env = self.envs[i]
                 assert env.state is not None
-                acting = env.state.current_team
                 action = RLAction(
                     player_index=int(players[i]),
                     direction_raw=dirs[i],
                     power=float(powers[i]),
                 )
-                # Apply shaping scale schedule
                 env._shaping_override = self.rl_config.shaping_scale_at(self.global_step)
                 result = env.step(action)
                 rewards[i] = result.reward
@@ -207,35 +404,19 @@ class Trainer:
                 if done:
                     st = env.state
                     assert st is not None
-                    team = self._learner_team[i]
-                    if self._both_sides(i):
-                        # attribute from last acting team already in reward; track scores neutrally
-                        if st.score_a > st.score_b:
-                            wins += 0.5
-                            losses += 0.5
-                        elif st.score_b > st.score_a:
-                            wins += 0.5
-                            losses += 0.5
-                        else:
-                            draws += 1
-                        goals_for += (st.score_a + st.score_b) / 2
-                        goals_against += (st.score_a + st.score_b) / 2
-                    else:
-                        my = st.score_a if team == Team.A else st.score_b
-                        opp = st.score_b if team == Team.A else st.score_a
-                        goals_for += my
-                        goals_against += opp
-                        if my > opp:
-                            wins += 1
-                        elif my < opp:
-                            losses += 1
-                        else:
-                            draws += 1
-                    ep_rewards.append(float(self._ep_returns[i]))
-                    ep_lens.append(float(result.info.get("turns", 0)))
+                    self._record_episode_outcome(
+                        both=self._both_sides(i),
+                        team=self._learner_team[i],
+                        score_a=st.score_a,
+                        score_b=st.score_b,
+                        ep_reward=float(self._ep_returns[i]),
+                        ep_turns=float(result.info.get("turns", 0)),
+                        ep_rewards=ep_rewards,
+                        ep_lens=ep_lens,
+                        tallies=tallies,
+                    )
                     self._reset_env(i)
                 else:
-                    # If next turn is opponent-controlled, auto-step them
                     both = self._both_sides(i)
                     if not both and env.state is not None:
                         while (
@@ -246,24 +427,20 @@ class Trainer:
                                 env.state, env.state.current_team
                             )
                             opp_res = env.step(opp_action)
-                            # Learner does not store opponent rewards in this transition;
-                            # episode end handling:
                             if opp_res.terminated or opp_res.truncated:
                                 st = env.state
                                 assert st is not None
-                                team = self._learner_team[i]
-                                my = st.score_a if team == Team.A else st.score_b
-                                opp_s = st.score_b if team == Team.A else st.score_a
-                                goals_for += my
-                                goals_against += opp_s
-                                if my > opp_s:
-                                    wins += 1
-                                elif my < opp_s:
-                                    losses += 1
-                                else:
-                                    draws += 1
-                                ep_rewards.append(float(self._ep_returns[i]))
-                                ep_lens.append(float(opp_res.info.get("turns", 0)))
+                                self._record_episode_outcome(
+                                    both=False,
+                                    team=self._learner_team[i],
+                                    score_a=st.score_a,
+                                    score_b=st.score_b,
+                                    ep_reward=float(self._ep_returns[i]),
+                                    ep_turns=float(opp_res.info.get("turns", 0)),
+                                    ep_rewards=ep_rewards,
+                                    ep_lens=ep_lens,
+                                    tallies=tallies,
+                                )
                                 dones[i] = 1.0
                                 self._reset_env(i)
                                 break
@@ -284,7 +461,6 @@ class Trainer:
                 values,
             )
 
-        # Bootstrap values
         obs_batch = np.stack(self._obs, axis=0)
         obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device)
         with torch.no_grad():
@@ -297,11 +473,11 @@ class Trainer:
         return {
             "game/reward": float(np.mean(ep_rewards)) if ep_rewards else 0.0,
             "game/length": float(np.mean(ep_lens)) if ep_lens else 0.0,
-            "game/win_rate": wins / n if ep_rewards else 0.0,
-            "game/draw_rate": draws / n if ep_rewards else 0.0,
-            "game/loss_rate": losses / n if ep_rewards else 0.0,
-            "game/goals_for": goals_for / n if ep_rewards else 0.0,
-            "game/goals_against": goals_against / n if ep_rewards else 0.0,
+            "game/win_rate": tallies["wins"] / n if ep_rewards else 0.0,
+            "game/draw_rate": tallies["draws"] / n if ep_rewards else 0.0,
+            "game/loss_rate": tallies["losses"] / n if ep_rewards else 0.0,
+            "game/goals_for": tallies["goals_for"] / n if ep_rewards else 0.0,
+            "game/goals_against": tallies["goals_against"] / n if ep_rewards else 0.0,
             "perf/env_steps_per_sec": self.rl_config.rollout_steps
             * self.rl_config.num_envs
             / elapsed,
@@ -311,9 +487,11 @@ class Trainer:
         total = total_steps or self.rl_config.total_steps
         self._init_envs()
         buffer = RolloutBuffer(self.rl_config, self.rl_config.num_envs)
+        workers = self.rl_config.num_workers if self._use_parallel else 0
         print(
             f"Training {self.rl_config.run_name} on {self.device} | "
-            f"params={self.model.parameter_count()} | envs={self.rl_config.num_envs}"
+            f"params={self.model.parameter_count()} | envs={self.rl_config.num_envs} | "
+            f"workers={workers}"
         )
 
         while self.global_step < total:

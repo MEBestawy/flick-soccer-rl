@@ -102,12 +102,14 @@ class PolicyOpponent(Opponent):
         *,
         deterministic: bool = False,
         label: str = "policy",
+        checkpoint_path: Optional[str] = None,
     ) -> None:
         self.model = model
         self.rl_config = rl_config
         self.sim_config = sim_config
         self.deterministic = deterministic
         self.name = label
+        self.checkpoint_path = checkpoint_path
 
     def act(self, state: GameState, team: Team) -> RLAction:
         obs = observation_from_state(state, team, self.sim_config, self.rl_config)
