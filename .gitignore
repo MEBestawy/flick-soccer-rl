@@ -16,3 +16,6 @@ frontend/dist/
 json_cache.json
 *.pyc
 .python-version
+runs/
+*.pt
+*.pth
